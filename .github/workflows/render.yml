@@ -1,0 +1,68 @@
+name: Render route
+
+# Renders a TripTrail route on GitHub's hardware and publishes the clip as a
+# release, for whoever dispatched it to collect.
+#
+# This repo is public, so its run logs and release titles are too. The route
+# never goes into an env var (Actions prints a step's env in the log): the
+# scripts read it from the event file. A release is named by the caller's
+# opaque `ref`, never by the route's title.
+on:
+  workflow_dispatch:
+    inputs:
+      route:
+        description: 'Route JSON: {"title":…,"stops":[{"name":…,"lng":…,"lat":…,"mode":…}]}'
+        required: true
+        type: string
+  repository_dispatch:
+    types: [render-route]
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Needed to create the release.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: npm install
+      - run: npx playwright install --with-deps chromium
+
+      # TripTrail is MIT (© 2026 Fangyuan Lin). Served locally so the render
+      # never leans on the author's own hosting.
+      - name: Fetch and serve TripTrail
+        run: |
+          git clone --depth 1 https://github.com/Fangyuan025/triptrail.git triptrail
+
+          node patch-triptrail.mjs triptrail/app.js
+
+          cd triptrail && python3 -m http.server 8080 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8080/ >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://localhost:8080/ >/dev/null || { echo "server never came up"; exit 1; }
+
+      - name: Render
+        env:
+          TRIPTRAIL_URL: http://localhost:8080
+        run: node render.mjs
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: render-${{ github.run_number }}
+        run: |
+          # The caller's ref if it is a plain slug, else the tag itself.
+          NAME=$(node -e '
+            const e = require(process.env.GITHUB_EVENT_PATH);
+            const ref = String(e.client_payload?.ref ?? "");
+            process.stdout.write(/^[a-z0-9-]{1,40}$/.test(ref) ? ref : process.env.TAG);
+          ')
+          gh release create "$TAG" out/route.mp4 --title "$NAME" --notes "Run ${{ github.run_number }}."
